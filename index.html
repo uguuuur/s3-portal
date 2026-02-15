@@ -1,0 +1,130 @@
+const express = require('express');
+const https = require('https');
+const path = require('path');
+const app = express();
+
+app.use(express.json());
+app.use(express.static('public')); // HTML dosyasını servis etmek için
+
+// --- YAPILANDIRMA ---
+const ONTAP_CONFIG = {
+    ip: "192.168.0.136",
+    svm_uuid: "a2b5f372-0731-11f1-a02d-005056899e16",
+    user: "vsadmin",
+    pass: "Netapp1!",
+    s3_endpoint: "https://s3-srv.demo.netapp.com"
+};
+
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+// Senin makeRequest fonksiyonun
+function makeRequest(method, path, data = null) {
+    return new Promise((resolve, reject) => {
+        const auth = Buffer.from(`${ONTAP_CONFIG.user}:${ONTAP_CONFIG.pass}`).toString('base64');
+        const options = {
+            hostname: ONTAP_CONFIG.ip,
+            port: 443,
+            path: path,
+            method: method,
+            headers: {
+                'Authorization': `Basic ${auth}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            timeout: 30000
+        };
+
+        const req = https.request(options, (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += chunk);
+            res.on('end', () => {
+                try {
+                    const parsedData = body ? JSON.parse(body) : {};
+                    if (res.statusCode >= 200 && res.statusCode < 300) resolve(parsedData);
+                    else reject(new Error(`HTTP ${res.statusCode}: ${JSON.stringify(parsedData)}`));
+                } catch (e) { resolve(body); }
+            });
+        });
+        req.on('error', (err) => reject(err));
+        if (data) req.write(JSON.stringify(data));
+        req.end();
+    });
+}
+
+// API Endpoint: Bucket Oluştur
+app.post('/api/create-bucket', async (req, res) => {
+    const { bucketName, sizeMb } = req.body;
+    const bucketPath = `/api/protocols/s3/services/${ONTAP_CONFIG.svm_uuid}/buckets`;
+    const userPath = `/api/protocols/s3/services/${ONTAP_CONFIG.svm_uuid}/users`;
+
+    try {
+        // 1. Bucket Oluşturma
+        const bucketRes = await makeRequest('POST', bucketPath, {
+            name: bucketName,
+            size: parseInt(sizeMb) * 1024 * 1024
+        });
+
+        // Job Takibi
+        if (bucketRes.job) {
+            const jobUuid = bucketRes.job.uuid;
+            let finished = false;
+            while (!finished) {
+                const jobStatus = await makeRequest('GET', `/api/cluster/jobs/${jobUuid}`);
+                if (jobStatus.state === "success") finished = true;
+                else if (jobStatus.state === "failure") throw new Error(jobStatus.message);
+                else await new Promise(r => setTimeout(r, 2000));
+            }
+        }
+
+        // Bucket UUID al
+        const search = await makeRequest('GET', `${bucketPath}?name=${bucketName}`);
+        const bucketUuid = search.records[0].uuid;
+
+// 2. KULLANICI OLUŞTURMA VE KEY ALMA
+        let accessKey, secretKey;
+        try {
+            // Kullanıcıyı oluşturmayı dene
+            const userRes = await makeRequest('POST', userPath, { name: bucketName });
+            // Eğer yanıt bir dizi/record içinde geliyorsa (ONTAP sürümüne göre değişebilir)
+            if (userRes.access_key) {
+                accessKey = userRes.access_key;
+                secretKey = userRes.secret_key;
+            } else if (userRes.records && userRes.records[0]) {
+                accessKey = userRes.records[0].access_key;
+                secretKey = userRes.records[0].secret_key;
+            }
+        } catch (e) { 
+            console.log("Kullanıcı muhtemelen zaten var, mevcut anahtarlar alınıyor...");
+        }
+
+        // Eğer yukarıda anahtarlar alınamadıysa, kullanıcı detayından sorgula
+        if (!accessKey) {
+            const userDetail = await makeRequest('GET', `${userPath}/${bucketName}`);
+            accessKey = userDetail.access_key;
+            secretKey = userDetail.secret_key;
+        }
+
+        // 3. Yetkilendirme (Policy PATCH)
+        await makeRequest('PATCH', `${bucketPath}/${bucketUuid}`, {
+            policy: {
+                statements: [{
+                    sid: "FullAccess",
+                    effect: "allow",
+                    principals: [bucketName],
+                    resources: [bucketName, `${bucketName}/*`],
+                    actions: ["*"]
+                }]
+            }
+        });
+
+        res.json({
+            success: true,
+            data: { bucketName, endpoint: ONTAP_CONFIG.s3_endpoint, accessKey, secretKey }
+        });
+
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.listen(3000, () => console.log('Arayüz http://localhost:3000 adresinde yayında!'));
